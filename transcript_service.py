@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, AsyncGenerator
 import uvicorn
@@ -7,13 +8,18 @@ import asyncio
 import uuid
 from pathlib import Path
 import json
+import os
+import shutil  # Для удаления папок целиком
+import glob
+
+from transcript_engine import calculate_file_hash, process_audio_with_deepgram, analyze_transcript_suggestions
 
 # Import the agent creator and helper
 from agent.agent_meta import create_agent
 from agent.helper import AgentSession
 
 # OpenAI Agents imports
-from agents import Runner
+from agents import Runner, SQLiteSession
 
 try:
     from storage.conversation_repository import ConversationRepository, ArtifactType
@@ -24,14 +30,13 @@ except ImportError:
     ConversationRepository = None
     ArtifactType = None
     print("WARNING: conversation_repository not found. Metadata storage disabled.")
-    print("To enable: Place conversation_repository.py in the same directory.")
+
 
 # ============================================
-# Data Models
+# Data Models & Global State
 # ============================================
 
 class ConversationData(BaseModel):
-    """Conversation identification"""
     uuid: str
     user_uuid: str
 
@@ -49,432 +54,212 @@ class TaskRequest(BaseModel):
     transcript_path: Optional[str] = None
     stream: Optional[bool] = False
 
+
 class TaskResponse(BaseModel):
     task_id: str
 
+
 class TaskStatus(BaseModel):
-    """Task status response"""
-    status: str  # STARTED, SUCCESS, FAILED
+    status: str
     result: Optional[Dict[str, Any]] = None
     failure: Optional[str] = None
 
 
-# ============================================
-# Service State
-# ============================================
+# Global storage
+processing_status = {}
 
+
+def update_processing_status(file_hash: str, stage: str, percent: int):
+    processing_status[file_hash] = {
+        "status": "processing",
+        "stage": stage,
+        "percent": percent
+    }
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str(BASE_DIR / "conversations_metadata.db")
+MEMORY_DB_PATH = str(BASE_DIR / "analyst_memory.db")
+CONV_DIR = BASE_DIR / "conversations"
+TRANSCRIPTS_DIR = BASE_DIR / "transcripts" / "processed"
 class TranscriptService:
     def __init__(self):
         self.tasks: Dict[str, TaskStatus] = {}
         self.agents: Dict[str, Any] = {}
-        self.transcript_paths: Dict[str, str] = {}  # Store transcript paths per conversation
-        self.streaming_tasks: Dict[str, asyncio.Queue] = {}  # Queues for streaming
+        self.transcript_paths: Dict[str, str] = {}
+        self.streaming_tasks: Dict[str, asyncio.Queue] = {}
 
         if HAS_REPOSITORY and ConversationRepository is not None:
-            self.repo = ConversationRepository()
+            print(f"DEBUG: Using Database at {DB_PATH}")
+            self.repo = ConversationRepository(db_path=DB_PATH)
         else:
             self.repo = None
-            print("INFO: Running without metadata repository (AgentSession only)")
 
     def load_transcript(self, transcript_path: str) -> str:
         try:
             with open(transcript_path, 'r', encoding='utf-8') as f:
                 transcript = f.read()
             return transcript
-        except FileNotFoundError:
-            raise HTTPException(status_code=404, detail=f"Transcript file not found: {transcript_path}")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error loading transcript: {str(e)}")
+            return ""
 
     async def create_task(self, request: TaskRequest) -> str:
         task_id = str(uuid.uuid4())
-
-        # Initialize task as started
         self.tasks[task_id] = TaskStatus(status="STARTED")
-
-        # Create streaming queue if streaming is enabled
         if request.stream:
             self.streaming_tasks[task_id] = asyncio.Queue()
-
-        # Process asynchronously
         asyncio.create_task(self._process_task(task_id, request))
-
         return task_id
 
     async def _process_task(self, task_id: str, request: TaskRequest):
         stream_queue = self.streaming_tasks.get(task_id)
-
         try:
             conversation_id = request.conversation.uuid
             message_id = request.message.uuid
             prompt = request.message.prompt
 
-            # Store transcript path if provided in request
             if request.transcript_path:
                 self.transcript_paths[conversation_id] = request.transcript_path
 
-            # Get or create agent for this conversation
             if conversation_id not in self.agents:
-                # Load or create AgentSession for storing answers
                 agent_session = AgentSession(conversation_id, message_id)
                 agent_session.load()
 
-                # If session has no transcript, try to load from stored path or default
                 if not agent_session.transcript:
-                    if conversation_id in self.transcript_paths:
-                        transcript_path = self.transcript_paths[conversation_id]
-                    else:
-                        # Try default location
-                        transcript_path = f"transcripts/{conversation_id}.txt"
+                    transcript_path = self.transcript_paths.get(conversation_id,
+                                                                f"transcripts/processed/{conversation_id}.txt")
+                    if os.path.exists(transcript_path):
+                        agent_session.transcript = self.load_transcript(transcript_path)
+                        agent_session.save()
 
-                    transcript = self.load_transcript(transcript_path)
-                    # Save transcript to AgentSession
-                    agent_session.transcript = transcript
-                    agent_session.save()
-                else:
-                    transcript = agent_session.transcript
+                transcript = agent_session.transcript or ""
 
-                # Create agent with SQLite session (returns agent, sqlite_session)
-                agent, sqlite_session = await create_agent(
-                    conversation_id=conversation_id,
-                    transcript=transcript
-                )
-
+                agent, sqlite_session = await create_agent(conversation_id=conversation_id, transcript=transcript)
                 self.agents[conversation_id] = {
                     'agent': agent,
                     'sqlite_session': sqlite_session,
                     'agent_session': agent_session
                 }
             else:
-                # Get existing sessions
                 agent_data = self.agents[conversation_id]
                 agent = agent_data['agent']
                 sqlite_session = agent_data['sqlite_session']
                 agent_session = agent_data['agent_session']
                 agent_session.message_id = message_id
 
-            # Run agent with streaming if enabled
             if request.stream and stream_queue:
-                await self._run_agent_streaming(
-                    agent, prompt, sqlite_session, agent_session,
-                    task_id, stream_queue
-                )
+                await self._run_agent_streaming(agent, prompt, sqlite_session, agent_session, task_id, stream_queue)
             else:
-                await self._run_agent_non_streaming(
-                    agent, prompt, sqlite_session, agent_session,
-                    task_id
-                )
+                await self._run_agent_non_streaming(agent, prompt, sqlite_session, agent_session, task_id)
 
         except Exception as e:
             import traceback
-            error_details = traceback.format_exc()
-            print(f"Task {task_id} failed with error:\n{error_details}")
-
-            # Send error to stream if streaming
+            traceback.print_exc()
             if stream_queue:
-                await stream_queue.put({
-                    "type": "error",
-                    "error": str(e)
-                })
-                await stream_queue.put(None)  # End stream
-
-            self.tasks[task_id] = TaskStatus(
-                status="FAILED",
-                failure=str(e)
-            )
+                await stream_queue.put({"type": "error", "error": str(e)})
+                await stream_queue.put(None)
+            self.tasks[task_id] = TaskStatus(status="FAILED", failure=str(e))
         finally:
-            # Cleanup streaming queue
             if task_id in self.streaming_tasks:
                 del self.streaming_tasks[task_id]
 
-    async def _run_agent_non_streaming(
-            self, agent, prompt, sqlite_session, agent_session, task_id
-    ):
-        """Run agent without streaming"""
-        conversation_id = agent_session.conversation_id
-        message_id = agent_session.message_id
-
-        # Create conversation metadata if repository is available
+    async def _run_agent_non_streaming(self, agent, prompt, sqlite_session, agent_session, task_id):
         if self.repo:
-            self.repo.create_or_update_conversation(
-                conversation_uuid=conversation_id,
-                user_uuid="default-user",  # Will be updated from request
-                title=prompt[:50] if prompt else "Conversation"
-            )
+            self.repo.create_or_update_conversation(agent_session.conversation_id, "default-user", prompt[:50])
+            self.repo.create_message(agent_session.message_id, agent_session.conversation_id, "default-user", task_id,
+                                     prompt)
 
-            # Create message record
-            self.repo.create_message(
-                message_uuid=message_id,
-                conversation_uuid=conversation_id,
-                user_uuid="default-user",
-                task_id=task_id,
-                prompt=prompt
-            )
-
-        # Run agent using Runner.run() with session and context
-        result = await Runner.run(
-            agent,
-            prompt,
-            session=sqlite_session,
-            context=agent_session
-        )
-
-        # Extract answer text from result
+        result = await Runner.run(agent, prompt, session=sqlite_session, context=agent_session)
         answer_text = self._extract_answer_text(result)
 
-        # Add answer to AgentSession and save
         agent_session.add_answer(answer_text)
         agent_session.save()
 
-        # Update message with answer if repository is available
         if self.repo:
-            self.repo.update_message(
-                message_uuid=message_id,
-                answer=answer_text,
-                summary=answer_text[:200] if answer_text else None
-            )
+            self.repo.update_message(agent_session.message_id, answer=answer_text)
 
-        # Update task status
-        self.tasks[task_id] = TaskStatus(
-            status="SUCCESS",
-            result={
-                'text': answer_text,
-                'conversation_id': conversation_id
-            }
-        )
+        self.tasks[task_id] = TaskStatus(status="SUCCESS", result={'text': answer_text})
 
-    async def _run_agent_streaming(
-            self, agent, prompt, sqlite_session, agent_session, task_id, stream_queue
-    ):
-        """Run agent with streaming output"""
-        conversation_id = agent_session.conversation_id
-        message_id = agent_session.message_id
-
-        # Create conversation metadata if repository is available
+    async def _run_agent_streaming(self, agent, prompt, sqlite_session, agent_session, task_id, stream_queue):
         if self.repo:
-            self.repo.create_or_update_conversation(
-                conversation_uuid=conversation_id,
-                user_uuid="default-user",
-                title=prompt[:50] if prompt else "Conversation"
-            )
+            self.repo.create_or_update_conversation(agent_session.conversation_id, "default-user", prompt[:50])
+            self.repo.create_message(agent_session.message_id, agent_session.conversation_id, "default-user", task_id,
+                                     prompt)
 
-            # Create message record
-            self.repo.create_message(
-                message_uuid=message_id,
-                conversation_uuid=conversation_id,
-                user_uuid="default-user",
-                task_id=task_id,
-                prompt=prompt
-            )
-
-        # Use Runner.run_streamed() for streaming
-        streamed = Runner.run_streamed(
-            agent,
-            prompt,
-            session=sqlite_session,
-            context=agent_session
-        )
-
+        streamed = Runner.run_streamed(agent, prompt, session=sqlite_session, context=agent_session)
         full_text = ""
 
-        # Stream events
         async for event in streamed.stream_events():
-            # Handle different event types
-            if event.type == "raw_response_event":
-                # Text delta event
-                if hasattr(event, 'data') and hasattr(event.data, 'delta'):
-                    delta = event.data.delta
-                    full_text += delta
+            if event.type == "raw_response_event" and hasattr(event, 'data') and hasattr(event.data, 'delta'):
+                delta = event.data.delta
+                full_text += delta
+                await stream_queue.put({"type": "delta", "delta": delta, "accumulated": full_text})
 
-                    # Send delta to stream
-                    await stream_queue.put({
-                        "type": "delta",
-                        "delta": delta,
-                        "accumulated": full_text
-                    })
-
-            elif event.type == "run_item_stream_event":
-                # Tool call or other events
-                if hasattr(event.item, 'type'):
-                    await stream_queue.put({
-                        "type": "event",
-                        "event_type": event.item.type,
-                        "data": str(event.item)
-                    })
-
-        # Get final output
         final_output = streamed.final_output
         answer_text = self._extract_answer_text_from_final(final_output) or full_text
 
-        # Add answer to AgentSession and save
         agent_session.add_answer(answer_text)
         agent_session.save()
 
-        # Update message with answer if repository is available
         if self.repo:
-            self.repo.update_message(
-                message_uuid=message_id,
-                answer=answer_text,
-                summary=answer_text[:200] if answer_text else None
-            )
+            self.repo.update_message(agent_session.message_id, answer=answer_text)
 
-        # Send final message
-        await stream_queue.put({
-            "type": "done",
-            "text": answer_text,
-            "conversation_id": conversation_id
-        })
-
-        # End stream
+        await stream_queue.put({"type": "done", "text": answer_text})
         await stream_queue.put(None)
-
-        # Update task status
-        self.tasks[task_id] = TaskStatus(
-            status="SUCCESS",
-            result={
-                'text': answer_text,
-                'conversation_id': conversation_id
-            }
-        )
-
-        # Use Runner.run_streamed() for streaming
-        streamed = Runner.run_streamed(
-            agent,
-            prompt,
-            session=sqlite_session,
-            context=agent_session
-        )
-
-        full_text = ""
-
-        # Stream events
-        async for event in streamed.stream_events():
-            # Handle different event types
-            if event.type == "raw_response_event":
-                # Text delta event
-                if hasattr(event, 'data') and hasattr(event.data, 'delta'):
-                    delta = event.data.delta
-                    full_text += delta
-
-                    # Send delta to stream
-                    await stream_queue.put({
-                        "type": "delta",
-                        "delta": delta,
-                        "accumulated": full_text
-                    })
-
-            elif event.type == "run_item_stream_event":
-                # Tool call or other events
-                if hasattr(event.item, 'type'):
-                    await stream_queue.put({
-                        "type": "event",
-                        "event_type": event.item.type,
-                        "data": str(event.item)
-                    })
-
-        # Get final output
-        final_output = streamed.final_output
-        answer_text = self._extract_answer_text_from_final(final_output) or full_text
-
-        # Add answer to AgentSession and save
-        agent_session.add_answer(answer_text)
-        agent_session.save()
-
-        # Update message with answer
-        self.repo.update_message(
-            message_uuid=message_id,
-            answer=answer_text,
-            summary=answer_text[:200] if answer_text else None
-        )
-
-        # Send final message
-        await stream_queue.put({
-            "type": "done",
-            "text": answer_text,
-            "conversation_id": conversation_id
-        })
-
-        # End stream
-        await stream_queue.put(None)
-
-        # Update task status
-        self.tasks[task_id] = TaskStatus(
-            status="SUCCESS",
-            result={
-                'text': answer_text,
-                'conversation_id': conversation_id
-            }
-        )
+        self.tasks[task_id] = TaskStatus(status="SUCCESS", result={'text': answer_text})
 
     def _extract_answer_text(self, result) -> str:
-        """Extract answer text from Runner result"""
-        answer_text = ""
-
-        # Try to get text from final_output if available
-        if hasattr(result, 'final_output'):
-            final_output = result.final_output
-            if isinstance(final_output, str):
-                answer_text = final_output
-            elif hasattr(final_output, 'text_content'):
-                answer_text = final_output.text_content
-            elif hasattr(final_output, '__dict__'):
-                answer_text = str(final_output)
-            else:
-                answer_text = str(final_output)
-
-        # If no final_output, try to get from new_items or messages
-        elif hasattr(result, 'new_items') and result.new_items:
-            from agents import ItemHelpers
-            answer_text = ItemHelpers.text_message_outputs(result.new_items)
-
-        elif hasattr(result, 'messages') and result.messages:
-            # Get last message content
-            last_msg = result.messages[-1]
-            if hasattr(last_msg, 'content'):
-                if isinstance(last_msg.content, list):
-                    for item in last_msg.content:
-                        if hasattr(item, 'text'):
-                            answer_text += item.text
-                else:
-                    answer_text = str(last_msg.content)
-        else:
-            answer_text = str(result)
-
-        return answer_text
+        if hasattr(result, 'final_output'): return self._extract_answer_text_from_final(result.final_output)
+        return str(result)
 
     def _extract_answer_text_from_final(self, final_output) -> str:
-        """Extract answer text from final output object"""
-        if final_output is None:
-            return ""
-
-        if isinstance(final_output, str):
-            return final_output
-
-        if hasattr(final_output, 'text_content'):
-            return final_output.text_content
-
-        if hasattr(final_output, '__dict__'):
-            return str(final_output)
-
+        if final_output is None: return ""
+        if isinstance(final_output, str): return final_output
+        if hasattr(final_output, 'text_content'): return final_output.text_content
         return str(final_output)
 
     def get_task_status(self, task_id: str) -> TaskStatus:
-        """Get task status"""
-        if task_id not in self.tasks:
-            raise HTTPException(status_code=404, detail="Task not found")
+        if task_id not in self.tasks: raise HTTPException(status_code=404, detail="Task not found")
         return self.tasks[task_id]
 
-    def get_session(self, conversation_id: str) -> Optional[AgentSession]:
-        """Get AgentSession for a conversation"""
-        if conversation_id in self.agents:
-            return self.agents[conversation_id]['agent_session']
 
-        # Try to load from disk
-        session = AgentSession(conversation_id, "")
-        session.load()
-        if session.transcript:
-            return session
-        return None
+# ============================================
+# Background Process
+# ============================================
+
+def process_audio_background(file_bytes, transcript_path, file_hash, conversation_uuid, user_uuid, filename):
+    try:
+        def report_status(stage, pct):
+            update_processing_status(file_hash, stage, pct)
+
+        # 1. Transcribe
+        process_audio_with_deepgram(file_bytes, transcript_path, status_callback=report_status)
+
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            transcript_text = f.read()
+
+        # 2. Analyze Suggestions
+        analyze_transcript_suggestions(transcript_text, status_callback=report_status)
+
+        # 3. Finalize
+        report_status("Finalizing conversation...", 98)
+
+        session = AgentSession(conversation_uuid, "")
+        session.transcript = transcript_text
+        session.save()
+
+        if service.repo:
+            service.repo.create_or_update_conversation(
+                conversation_uuid=conversation_uuid,
+                user_uuid=user_uuid,
+                title=f"{filename}"
+            )
+            service.transcript_paths[conversation_uuid] = transcript_path
+
+        processing_status[file_hash] = {"status": "completed", "percent": 100, "stage": "Ready"}
+
+    except Exception as e:
+        print(f"Background processing error: {e}")
+        processing_status[file_hash] = {"status": "error", "error": str(e)}
 
 
 # ============================================
@@ -482,193 +267,190 @@ class TranscriptService:
 # ============================================
 
 app = FastAPI(title="Transcript Agent Service")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 service = TranscriptService()
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "active_conversations": len(service.agents),
-        "active_tasks": len([t for t in service.tasks.values() if t.status == "STARTED"])
-    }
+    return {"status": "healthy"}
 
 
 @app.post("/transcript/task", response_model=TaskResponse)
 async def create_task(request: TaskRequest):
-    """Create a new task"""
     task_id = await service.create_task(request)
     return TaskResponse(task_id=task_id)
 
 
 @app.get("/transcript/task/{task_id}", response_model=TaskStatus)
 async def get_task_status(task_id: str):
-    """Get task status"""
     return service.get_task_status(task_id)
 
 
 @app.get("/transcript/task/{task_id}/stream")
 async def stream_task_response(task_id: str):
-    """Stream task response in real-time (Server-Sent Events)"""
-
     if task_id not in service.streaming_tasks:
-        raise HTTPException(status_code=404, detail="Streaming not available for this task")
+        raise HTTPException(status_code=404, detail="Streaming not available")
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        """Generate Server-Sent Events"""
+    async def event_generator():
         queue = service.streaming_tasks[task_id]
-
         try:
             while True:
-                # Get next event from queue
                 event = await queue.get()
-
-                # None signals end of stream
                 if event is None:
                     yield f"data: {json.dumps({'type': 'end'})}\n\n"
                     break
-
-                # Send event as SSE
                 yield f"data: {json.dumps(event)}\n\n"
-
         except Exception as e:
-            error_event = {
-                "type": "error",
-                "error": str(e)
-            }
-            yield f"data: {json.dumps(error_event)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    )
-
-
-@app.post("/transcript/load")
-async def load_transcript(conversation_id: str, transcript_path: str):
-    """Load transcript for a conversation"""
-    try:
-        transcript = service.load_transcript(transcript_path)
-
-        # Store the transcript path for this conversation
-        service.transcript_paths[conversation_id] = transcript_path
-
-        # Create session and save transcript
-        session = AgentSession(conversation_id, "")
-        session.transcript = transcript
-        session.save()
-
-        return {
-            "status": "success",
-            "conversation_id": conversation_id,
-            "transcript_length": len(transcript)
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/transcript/history/{conversation_id}")
-async def get_conversation_history(conversation_id: str):
-    """Get conversation history"""
-    session = service.get_session(conversation_id)
-
-    if not session:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    return {
-        "conversation_id": conversation_id,
-        "transcript_length": len(session.transcript),
-        "answers": session.answers
-    }
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.get("/conversations/list")
 async def list_conversations(user_uuid: str, limit: int = 100):
-    """List all conversations for a user"""
-    if not service.repo:
-        raise HTTPException(
-            status_code=503,
-            detail="Metadata repository not available. Add conversation_repository.py to enable."
-        )
-
-    conversations = service.repo.list_conversations(user_uuid, limit)
-
-    return {
-        "conversations": [
-            {
-                "uuid": conv.uuid,
-                "user_uuid": conv.user_uuid,
-                "title": conv.title,
-                "created_at": conv.created_at,
-                "updated_at": conv.updated_at,
-                "message_count": conv.message_count
-            }
-            for conv in conversations
-        ]
-    }
+    if not service.repo: return {"conversations": []}
+    convs = service.repo.list_conversations(user_uuid, limit)
+    return {"conversations": convs}
 
 
 @app.get("/conversations/{conversation_uuid}/messages")
 async def get_conversation_messages(conversation_uuid: str, limit: int = 100):
-    """Get all messages in a conversation"""
-    if not service.repo:
-        raise HTTPException(
-            status_code=503,
-            detail="Metadata repository not available. Add conversation_repository.py to enable."
-        )
+    if not service.repo: return {"messages": []}
+    msgs = service.repo.list_messages(conversation_uuid, limit)
+    return {"conversation_uuid": conversation_uuid, "messages": msgs}
 
-    messages = service.repo.list_messages(conversation_uuid, limit)
+
+@app.get("/conversations/{conversation_uuid}/suggestions")
+async def get_suggestions(conversation_uuid: str):
+    # Use logic from engine
+    from transcript_engine import analyze_transcript_suggestions
+    return analyze_transcript_suggestions("")
+
+
+@app.delete("/conversations/{conversation_uuid}")
+async def delete_conversation(conversation_uuid: str):
+    if service.repo:
+        service.repo.delete_conversation(conversation_uuid)
+    if conversation_uuid in service.agents:
+        del service.agents[conversation_uuid]
+    return {"status": "deleted"}
+
+
+# =========================================================
+# ИСПРАВЛЕННАЯ ФУНКЦИЯ ПОЛНОГО УДАЛЕНИЯ (HARD RESET)
+# =========================================================
+@app.delete("/conversations/clear")
+async def clear_history(user_uuid: str):
+    print("!!! STARTING NUCLEAR RESET !!!")
+
+    # 1. Сбрасываем память в RAM
+    service.agents = {}
+
+    # 2. Удаляем файлы баз данных (включая временные файлы .wal и .shm)
+    # Используем glob, чтобы удалить "conversations_metadata.db", "...db-wal", "...db-shm"
+    for db_file in glob.glob(f"{DB_PATH}*"):
+        try:
+            os.remove(db_file)
+            print(f"Deleted DB file: {db_file}")
+        except Exception as e:
+            print(f"Error deleting {db_file}: {e}")
+
+    # То же самое для памяти агента
+    for db_file in glob.glob(f"{MEMORY_DB_PATH}*"):
+        try:
+            os.remove(db_file)
+        except:
+            pass
+
+    # 3. Удаляем папки
+    for folder in [CONV_DIR, TRANSCRIPTS_DIR]:
+        if folder.exists():
+            for item in folder.iterdir():
+                try:
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        shutil.rmtree(item)
+                except Exception as e:
+                    print(f"Error cleaning {item}: {e}")
+
+    # 4. Пересоздаем пустую структуру БД прямо сейчас
+    if service.repo:
+        try:
+            # Важно: переинициализируем соединение, так как файл был удален
+            service.repo._init_db()
+            print("Database structure re-created.")
+        except Exception as e:
+            print(f"Re-init error: {e}")
+
+    return {"status": "cleared_completely"}
+
+
+@app.get("/conversations/processing/{file_hash}")
+async def get_processing_status_endpoint(file_hash: str):
+    return processing_status.get(file_hash, {"status": "unknown"})
+
+
+@app.post("/conversations/upload")
+async def upload_audio_and_start(
+        background_tasks: BackgroundTasks,
+        file: UploadFile = File(...),
+        user_uuid: str = Form(...)
+):
+    file_bytes = await file.read()
+    file_hash = calculate_file_hash(file_bytes)
+
+    transcript_dir = "transcripts/processed"
+    os.makedirs(transcript_dir, exist_ok=True)
+    transcript_path = f"{transcript_dir}/{file_hash}.txt"
+
+    conversation_uuid = str(uuid.uuid4())
+    is_cached = os.path.exists(transcript_path)
+
+    if not is_cached:
+        processing_status[file_hash] = {"status": "uploading", "stage": "Queued", "percent": 0}
+        background_tasks.add_task(
+            process_audio_background,
+            file_bytes,
+            transcript_path,
+            file_hash,
+            conversation_uuid,
+            user_uuid,
+            file.filename
+        )
+    else:
+        session = AgentSession(conversation_uuid, "")
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            session.transcript = f.read()
+        session.save()
+
+        if service.repo:
+            service.repo.create_or_update_conversation(
+                conversation_uuid=conversation_uuid,
+                user_uuid=user_uuid,
+                title=f"{file.filename} (Cached)"
+            )
+            service.transcript_paths[conversation_uuid] = transcript_path
 
     return {
+        "status": "success",
         "conversation_uuid": conversation_uuid,
-        "messages": [
-            {
-                "uuid": msg.uuid,
-                "prompt": msg.prompt,
-                "answer": msg.answer,
-                "summary": msg.summary,
-                "created_at": msg.created_at,
-                "artifacts": msg.artifacts
-            }
-            for msg in messages
-        ]
+        "file_hash": file_hash,
+        "is_cached": is_cached,
+        "filename": file.filename
     }
 
 
-# ============================================
-# Main Entry Point
-# ============================================
-
-def main():
-    """Run the service"""
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Transcript Agent Service')
-    parser.add_argument('--host', default='0.0.0.0', help='Host to bind to')
-    parser.add_argument('--port', type=int, default=8000, help='Port to bind to')
-    parser.add_argument('--reload', action='store_true', help='Enable auto-reload')
-
-    args = parser.parse_args()
-
-    # Ensure required directories exist
-    Path("transcripts").mkdir(exist_ok=True)
-    Path("conversations").mkdir(exist_ok=True)
-
-    uvicorn.run(
-        "transcript_service:app",
-        host=args.host,
-        port=args.port,
-        reload=args.reload
-    )
-
-
 if __name__ == "__main__":
-    main()
+    Path("transcripts/processed").mkdir(parents=True, exist_ok=True)
+    Path("conversations").mkdir(exist_ok=True)
+    uvicorn.run("transcript_service:app", host="0.0.0.0", port=8000, reload=True)

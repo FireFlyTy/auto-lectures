@@ -212,9 +212,47 @@ class ConversationRepository:
                 ))
             
             return conversations
-    
+
+    def delete_conversation(self, conversation_uuid: str):
+        """Delete a single conversation and all related messages/artifacts"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # Delete artifacts
+            cursor.execute('''
+                DELETE FROM artifacts 
+                WHERE message_uuid IN (SELECT uuid FROM messages WHERE conversation_uuid = ?)
+            ''', (conversation_uuid,))
+
+            # Delete messages
+            cursor.execute('DELETE FROM messages WHERE conversation_uuid = ?', (conversation_uuid,))
+
+            # Delete conversation
+            cursor.execute('DELETE FROM conversations WHERE uuid = ?', (conversation_uuid,))
+            conn.commit()
+
+    def delete_all(self, user_uuid: str = None):
+        """
+        Удаляет ВСЕ данные из базы, игнорируя user_uuid.
+        Мы игнорируем аргумент user_uuid, чтобы гарантированно стереть всё.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # Отключаем проверку связей, чтобы не возиться с порядком удаления
+            cursor.execute("PRAGMA foreign_keys = OFF;")
+
+            # Удаляем ВСЕ строки из таблиц. Без условий WHERE.
+            cursor.execute("DELETE FROM artifacts;")
+            cursor.execute("DELETE FROM messages;")
+            cursor.execute("DELETE FROM conversations;")
+
+            cursor.execute("PRAGMA foreign_keys = ON;")
+            conn.commit()
+
+            # Принудительно сжимаем базу, чтобы убедиться, что данные стерты физически
+            cursor.execute("VACUUM;")
+
     # ============ Messages ============
-    
+
     def create_message(
         self,
         message_uuid: str,
@@ -229,13 +267,13 @@ class ConversationRepository:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             now = datetime.now().isoformat()
-            
+
             cursor.execute('''
                 INSERT INTO messages 
                 (uuid, conversation_uuid, user_uuid, task_id, prompt, answer, summary, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (message_uuid, conversation_uuid, user_uuid, task_id, prompt, answer, summary, now))
-            
+
             # Update conversation message count and updated_at
             cursor.execute('''
                 UPDATE conversations 
@@ -243,11 +281,11 @@ class ConversationRepository:
                     updated_at = ?
                 WHERE uuid = ?
             ''', (now, conversation_uuid))
-            
+
             conn.commit()
-            
+
             return self.get_message(message_uuid)
-    
+
     def update_message(
         self,
         message_uuid: str,
@@ -257,18 +295,18 @@ class ConversationRepository:
         """Update message answer/summary"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            
+
             updates = []
             params = []
-            
+
             if answer is not None:
                 updates.append('answer = ?')
                 params.append(answer)
-            
+
             if summary is not None:
                 updates.append('summary = ?')
                 params.append(summary)
-            
+
             if updates:
                 params.append(message_uuid)
                 cursor.execute(
@@ -276,16 +314,16 @@ class ConversationRepository:
                     params
                 )
                 conn.commit()
-            
+
             return self.get_message(message_uuid)
-    
+
     def get_message(self, message_uuid: str) -> Optional[Message]:
         """Get message by UUID"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM messages WHERE uuid = ?', (message_uuid,))
             row = cursor.fetchone()
-            
+
             if row:
                 # Get artifacts
                 cursor.execute(
@@ -293,7 +331,7 @@ class ConversationRepository:
                     (message_uuid,)
                 )
                 artifacts = [dict(art_row) for art_row in cursor.fetchall()]
-                
+
                 return Message(
                     uuid=row['uuid'],
                     conversation_uuid=row['conversation_uuid'],
@@ -306,18 +344,18 @@ class ConversationRepository:
                     artifacts=artifacts
                 )
             return None
-    
+
     def get_message_by_task_id(self, task_id: str) -> Optional[Message]:
         """Get message by task_id"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT uuid FROM messages WHERE task_id = ?', (task_id,))
             row = cursor.fetchone()
-            
+
             if row:
                 return self.get_message(row['uuid'])
             return None
-    
+
     def list_messages(
         self,
         conversation_uuid: str,
@@ -332,17 +370,17 @@ class ConversationRepository:
                 ORDER BY created_at ASC 
                 LIMIT ?
             ''', (conversation_uuid, limit))
-            
+
             messages = []
             for row in cursor.fetchall():
                 msg = self.get_message(row['uuid'])
                 if msg:
                     messages.append(msg)
-            
+
             return messages
-    
+
     # ============ Artifacts ============
-    
+
     def create_artifact(
         self,
         message_uuid: str,
@@ -355,18 +393,18 @@ class ConversationRepository:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             now = datetime.now().isoformat()
-            
+
             data_json = json.dumps(data) if data else None
-            
+
             cursor.execute('''
                 INSERT INTO artifacts 
                 (message_uuid, artifact_type, name, path, data, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (message_uuid, artifact_type, name, path, data_json, now))
-            
+
             artifact_id = cursor.lastrowid
             conn.commit()
-            
+
             return Artifact(
                 id=artifact_id,
                 message_uuid=message_uuid,
@@ -376,7 +414,7 @@ class ConversationRepository:
                 data=data_json,
                 created_at=now
             )
-    
+
     def list_artifacts(self, message_uuid: str) -> List[Artifact]:
         """List artifacts for a message"""
         with self._get_connection() as conn:
@@ -385,7 +423,7 @@ class ConversationRepository:
                 'SELECT * FROM artifacts WHERE message_uuid = ?',
                 (message_uuid,)
             )
-            
+
             artifacts = []
             for row in cursor.fetchall():
                 artifacts.append(Artifact(
@@ -397,5 +435,21 @@ class ConversationRepository:
                     data=row['data'],
                     created_at=row['created_at']
                 ))
-            
+
             return artifacts
+
+    def hard_reset(self):
+        """
+        Drop all tables to clear DB completely without deleting the file.
+        This avoids 'file is locked' errors.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # Сносим таблицы
+            cursor.execute("DROP TABLE IF EXISTS artifacts")
+            cursor.execute("DROP TABLE IF EXISTS messages")
+            cursor.execute("DROP TABLE IF EXISTS conversations")
+            conn.commit()
+
+        # Сразу пересоздаем пустую структуру
+        self._init_db()
