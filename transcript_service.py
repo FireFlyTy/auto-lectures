@@ -2,23 +2,22 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTa
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, Any, Optional, AsyncGenerator
+from typing import Dict, Any, Optional
+from dataclasses import asdict
+from datetime import datetime
 import uvicorn
 import asyncio
 import uuid
 from pathlib import Path
 import json
 import os
-import shutil  # Для удаления папок целиком
+import shutil
 import glob
 
 from transcript_engine import calculate_file_hash, process_audio_with_deepgram, analyze_transcript_suggestions
 
-# Import the agent creator and helper
 from agent.agent_meta import create_agent
 from agent.helper import AgentSession
-
-# OpenAI Agents imports
 from agents import Runner, SQLiteSession
 
 try:
@@ -29,12 +28,8 @@ except ImportError:
     HAS_REPOSITORY = False
     ConversationRepository = None
     ArtifactType = None
-    print("WARNING: conversation_repository not found. Metadata storage disabled.")
+    print("WARNING: conversation_repository not found.")
 
-
-# ============================================
-# Data Models & Global State
-# ============================================
 
 class ConversationData(BaseModel):
     uuid: str
@@ -65,8 +60,14 @@ class TaskStatus(BaseModel):
     failure: Optional[str] = None
 
 
-# Global storage
-processing_status = {}
+processing_status: Dict[str, Any] = {}
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str(BASE_DIR / "conversations_metadata.db")
+MEMORY_DB_PATH = str(BASE_DIR / "analyst_memory.db")
+CONV_DIR = BASE_DIR / "conversations"
+TRANSCRIPTS_DIR = BASE_DIR / "transcripts" / "processed"
+SUGGESTIONS_DIR = BASE_DIR / "suggestions"
 
 
 def update_processing_status(file_hash: str, stage: str, percent: int):
@@ -76,11 +77,23 @@ def update_processing_status(file_hash: str, stage: str, percent: int):
         "percent": percent
     }
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = str(BASE_DIR / "conversations_metadata.db")
-MEMORY_DB_PATH = str(BASE_DIR / "analyst_memory.db")
-CONV_DIR = BASE_DIR / "conversations"
-TRANSCRIPTS_DIR = BASE_DIR / "transcripts" / "processed"
+
+def save_suggestions(file_hash: str, suggestions: list):
+    SUGGESTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    filepath = SUGGESTIONS_DIR / f"{file_hash}.json"
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(suggestions, f, ensure_ascii=False, indent=2)
+    print(f"✓ Saved suggestions to {filepath}")
+
+
+def load_suggestions(file_hash: str) -> list:
+    filepath = SUGGESTIONS_DIR / f"{file_hash}.json"
+    if filepath.exists():
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
 class TranscriptService:
     def __init__(self):
         self.tasks: Dict[str, TaskStatus] = {}
@@ -97,9 +110,8 @@ class TranscriptService:
     def load_transcript(self, transcript_path: str) -> str:
         try:
             with open(transcript_path, 'r', encoding='utf-8') as f:
-                transcript = f.read()
-            return transcript
-        except Exception as e:
+                return f.read()
+        except:
             return ""
 
     async def create_task(self, request: TaskRequest) -> str:
@@ -125,14 +137,15 @@ class TranscriptService:
                 agent_session.load()
 
                 if not agent_session.transcript:
-                    transcript_path = self.transcript_paths.get(conversation_id,
-                                                                f"transcripts/processed/{conversation_id}.txt")
+                    transcript_path = self.transcript_paths.get(
+                        conversation_id,
+                        f"transcripts/processed/{conversation_id}.txt"
+                    )
                     if os.path.exists(transcript_path):
                         agent_session.transcript = self.load_transcript(transcript_path)
                         agent_session.save()
 
                 transcript = agent_session.transcript or ""
-
                 agent, sqlite_session = await create_agent(conversation_id=conversation_id, transcript=transcript)
                 self.agents[conversation_id] = {
                     'agent': agent,
@@ -164,24 +177,32 @@ class TranscriptService:
 
     async def _run_agent_non_streaming(self, agent, prompt, sqlite_session, agent_session, task_id):
         if self.repo:
-            self.repo.create_or_update_conversation(agent_session.conversation_id, "default-user", prompt[:50])
+            # Проверяем, есть ли уже сообщения - если нет, это первое сообщение
+            existing_msgs = self.repo.list_messages(agent_session.conversation_id, limit=1)
+            if not existing_msgs:
+                # Первое сообщение - устанавливаем авто-имя
+                auto_title = prompt[:50] + ("..." if len(prompt) > 50 else "")
+                self.repo.create_or_update_conversation(agent_session.conversation_id, "default-user", title=auto_title)
             self.repo.create_message(agent_session.message_id, agent_session.conversation_id, "default-user", task_id,
                                      prompt)
 
         result = await Runner.run(agent, prompt, session=sqlite_session, context=agent_session)
         answer_text = self._extract_answer_text(result)
-
         agent_session.add_answer(answer_text)
         agent_session.save()
 
         if self.repo:
             self.repo.update_message(agent_session.message_id, answer=answer_text)
-
         self.tasks[task_id] = TaskStatus(status="SUCCESS", result={'text': answer_text})
 
     async def _run_agent_streaming(self, agent, prompt, sqlite_session, agent_session, task_id, stream_queue):
         if self.repo:
-            self.repo.create_or_update_conversation(agent_session.conversation_id, "default-user", prompt[:50])
+            # Проверяем, есть ли уже сообщения - если нет, это первое сообщение
+            existing_msgs = self.repo.list_messages(agent_session.conversation_id, limit=1)
+            if not existing_msgs:
+                # Первое сообщение - устанавливаем авто-имя
+                auto_title = prompt[:50] + ("..." if len(prompt) > 50 else "")
+                self.repo.create_or_update_conversation(agent_session.conversation_id, "default-user", title=auto_title)
             self.repo.create_message(agent_session.message_id, agent_session.conversation_id, "default-user", task_id,
                                      prompt)
 
@@ -196,7 +217,6 @@ class TranscriptService:
 
         final_output = streamed.final_output
         answer_text = self._extract_answer_text_from_final(final_output) or full_text
-
         agent_session.add_answer(answer_text)
         agent_session.save()
 
@@ -208,63 +228,73 @@ class TranscriptService:
         self.tasks[task_id] = TaskStatus(status="SUCCESS", result={'text': answer_text})
 
     def _extract_answer_text(self, result) -> str:
-        if hasattr(result, 'final_output'): return self._extract_answer_text_from_final(result.final_output)
+        if hasattr(result, 'final_output'):
+            return self._extract_answer_text_from_final(result.final_output)
         return str(result)
 
     def _extract_answer_text_from_final(self, final_output) -> str:
-        if final_output is None: return ""
-        if isinstance(final_output, str): return final_output
-        if hasattr(final_output, 'text_content'): return final_output.text_content
+        if final_output is None:
+            return ""
+        if isinstance(final_output, str):
+            return final_output
+        if hasattr(final_output, 'text_content'):
+            return final_output.text_content
         return str(final_output)
 
     def get_task_status(self, task_id: str) -> TaskStatus:
-        if task_id not in self.tasks: raise HTTPException(status_code=404, detail="Task not found")
+        if task_id not in self.tasks:
+            raise HTTPException(status_code=404, detail="Task not found")
         return self.tasks[task_id]
 
+    def reset(self):
+        self.tasks = {}
+        self.agents = {}
+        self.transcript_paths = {}
+        self.streaming_tasks = {}
+        self.repo = None
 
-# ============================================
-# Background Process
-# ============================================
 
 def process_audio_background(file_bytes, transcript_path, file_hash, conversation_uuid, user_uuid, filename):
     try:
         def report_status(stage, pct):
             update_processing_status(file_hash, stage, pct)
 
-        # 1. Transcribe
         process_audio_with_deepgram(file_bytes, transcript_path, status_callback=report_status)
 
         with open(transcript_path, 'r', encoding='utf-8') as f:
             transcript_text = f.read()
 
-        # 2. Analyze Suggestions
-        analyze_transcript_suggestions(transcript_text, status_callback=report_status)
+        report_status("Generating suggestions...", 85)
+        suggestions = analyze_transcript_suggestions(transcript_text, status_callback=report_status)
 
-        # 3. Finalize
-        report_status("Finalizing conversation...", 98)
+        if suggestions:
+            save_suggestions(file_hash, suggestions)
+
+        report_status("Finalizing...", 98)
 
         session = AgentSession(conversation_uuid, "")
         session.transcript = transcript_text
         session.save()
 
         if service.repo:
+            # Сохраняем file_hash в базу!
             service.repo.create_or_update_conversation(
                 conversation_uuid=conversation_uuid,
                 user_uuid=user_uuid,
-                title=f"{filename}"
+                title=filename,
+                file_hash=file_hash
             )
             service.transcript_paths[conversation_uuid] = transcript_path
 
         processing_status[file_hash] = {"status": "completed", "percent": 100, "stage": "Ready"}
+        print(f"✓ Processing complete: {conversation_uuid} (hash: {file_hash})")
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"Background processing error: {e}")
         processing_status[file_hash] = {"status": "error", "error": str(e)}
 
-
-# ============================================
-# FastAPI Application
-# ============================================
 
 app = FastAPI(title="Transcript Agent Service")
 
@@ -291,7 +321,7 @@ async def create_task(request: TaskRequest):
 
 
 @app.get("/transcript/task/{task_id}", response_model=TaskStatus)
-async def get_task_status(task_id: str):
+async def get_task_status_endpoint(task_id: str):
     return service.get_task_status(task_id)
 
 
@@ -317,23 +347,90 @@ async def stream_task_response(task_id: str):
 
 @app.get("/conversations/list")
 async def list_conversations(user_uuid: str, limit: int = 100):
-    if not service.repo: return {"conversations": []}
+    if not service.repo:
+        return {"conversations": []}
     convs = service.repo.list_conversations(user_uuid, limit)
-    return {"conversations": convs}
+    # Конвертируем dataclass в dict для JSON
+    return {"conversations": [asdict(c) for c in convs]}
 
 
 @app.get("/conversations/{conversation_uuid}/messages")
 async def get_conversation_messages(conversation_uuid: str, limit: int = 100):
-    if not service.repo: return {"messages": []}
+    if not service.repo:
+        return {"messages": []}
     msgs = service.repo.list_messages(conversation_uuid, limit)
-    return {"conversation_uuid": conversation_uuid, "messages": msgs}
+    return {"conversation_uuid": conversation_uuid, "messages": [asdict(m) for m in msgs]}
 
 
-@app.get("/conversations/{conversation_uuid}/suggestions")
-async def get_suggestions(conversation_uuid: str):
-    # Use logic from engine
-    from transcript_engine import analyze_transcript_suggestions
-    return analyze_transcript_suggestions("")
+@app.get("/suggestions/{file_hash}")
+async def get_suggestions(file_hash: str):
+    return load_suggestions(file_hash)
+
+
+@app.patch("/conversations/{conversation_uuid}/rename")
+async def rename_conversation(conversation_uuid: str, title: str):
+    """Переименовать conversation"""
+    if service.repo:
+        conn = service.repo._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE conversations SET title = ?, updated_at = ? WHERE uuid = ?',
+            (title, datetime.now().isoformat(), conversation_uuid)
+        )
+        conn.commit()
+        return {"status": "renamed", "title": title}
+    raise HTTPException(status_code=400, detail="Repository not available")
+
+
+# clear ДОЛЖЕН быть ДО {conversation_uuid}
+@app.delete("/conversations/clear")
+async def clear_history(user_uuid: str):
+    global service, processing_status
+
+    print("=" * 60)
+    print("!!! STARTING COMPLETE NUCLEAR RESET !!!")
+    print("=" * 60)
+
+    if service.repo:
+        try:
+            service.repo.hard_reset()
+            print("✓ Database hard reset completed")
+        except Exception as e:
+            print(f"✗ Database reset error: {e}")
+
+    service.reset()
+    processing_status.clear()
+
+    for db_file in glob.glob(f"{MEMORY_DB_PATH}*"):
+        if os.path.exists(db_file):
+            try:
+                os.remove(db_file)
+                print(f"✓ Deleted: {db_file}")
+            except Exception as e:
+                print(f"✗ Error: {e}")
+
+    folders = [CONV_DIR, TRANSCRIPTS_DIR, SUGGESTIONS_DIR, BASE_DIR / "transcripts"]
+    for folder in folders:
+        if folder.exists():
+            try:
+                shutil.rmtree(folder)
+                print(f"✓ Deleted folder: {folder}")
+            except Exception as e:
+                print(f"✗ Error: {e}")
+
+    for folder in [CONV_DIR, TRANSCRIPTS_DIR, SUGGESTIONS_DIR]:
+        folder.mkdir(parents=True, exist_ok=True)
+    print("✓ Recreated empty folders")
+
+    if HAS_REPOSITORY and ConversationRepository is not None:
+        service.repo = ConversationRepository(db_path=DB_PATH)
+        print("✓ Repository reconnected")
+
+    print("=" * 60)
+    print("!!! RESET COMPLETE !!!")
+    print("=" * 60)
+
+    return {"status": "cleared_completely"}
 
 
 @app.delete("/conversations/{conversation_uuid}")
@@ -342,57 +439,15 @@ async def delete_conversation(conversation_uuid: str):
         service.repo.delete_conversation(conversation_uuid)
     if conversation_uuid in service.agents:
         del service.agents[conversation_uuid]
-    return {"status": "deleted"}
 
-
-# =========================================================
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ ПОЛНОГО УДАЛЕНИЯ (HARD RESET)
-# =========================================================
-@app.delete("/conversations/clear")
-async def clear_history(user_uuid: str):
-    print("!!! STARTING NUCLEAR RESET !!!")
-
-    # 1. Сбрасываем память в RAM
-    service.agents = {}
-
-    # 2. Удаляем файлы баз данных (включая временные файлы .wal и .shm)
-    # Используем glob, чтобы удалить "conversations_metadata.db", "...db-wal", "...db-shm"
-    for db_file in glob.glob(f"{DB_PATH}*"):
+    session_file = CONV_DIR / conversation_uuid
+    if session_file.exists():
         try:
-            os.remove(db_file)
-            print(f"Deleted DB file: {db_file}")
-        except Exception as e:
-            print(f"Error deleting {db_file}: {e}")
-
-    # То же самое для памяти агента
-    for db_file in glob.glob(f"{MEMORY_DB_PATH}*"):
-        try:
-            os.remove(db_file)
+            session_file.unlink()
         except:
             pass
 
-    # 3. Удаляем папки
-    for folder in [CONV_DIR, TRANSCRIPTS_DIR]:
-        if folder.exists():
-            for item in folder.iterdir():
-                try:
-                    if item.is_file():
-                        item.unlink()
-                    elif item.is_dir():
-                        shutil.rmtree(item)
-                except Exception as e:
-                    print(f"Error cleaning {item}: {e}")
-
-    # 4. Пересоздаем пустую структуру БД прямо сейчас
-    if service.repo:
-        try:
-            # Важно: переинициализируем соединение, так как файл был удален
-            service.repo._init_db()
-            print("Database structure re-created.")
-        except Exception as e:
-            print(f"Re-init error: {e}")
-
-    return {"status": "cleared_completely"}
+    return {"status": "deleted"}
 
 
 @app.get("/conversations/processing/{file_hash}")
@@ -409,9 +464,8 @@ async def upload_audio_and_start(
     file_bytes = await file.read()
     file_hash = calculate_file_hash(file_bytes)
 
-    transcript_dir = "transcripts/processed"
-    os.makedirs(transcript_dir, exist_ok=True)
-    transcript_path = f"{transcript_dir}/{file_hash}.txt"
+    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    transcript_path = str(TRANSCRIPTS_DIR / f"{file_hash}.txt")
 
     conversation_uuid = str(uuid.uuid4())
     is_cached = os.path.exists(transcript_path)
@@ -433,11 +487,19 @@ async def upload_audio_and_start(
             session.transcript = f.read()
         session.save()
 
+        existing_suggestions = load_suggestions(file_hash)
+        if not existing_suggestions:
+            suggestions = analyze_transcript_suggestions(session.transcript)
+            if suggestions:
+                save_suggestions(file_hash, suggestions)
+
         if service.repo:
+            # Сохраняем file_hash в базу!
             service.repo.create_or_update_conversation(
                 conversation_uuid=conversation_uuid,
                 user_uuid=user_uuid,
-                title=f"{file.filename} (Cached)"
+                title=f"{file.filename} (Cached)",
+                file_hash=file_hash
             )
             service.transcript_paths[conversation_uuid] = transcript_path
 
@@ -451,6 +513,7 @@ async def upload_audio_and_start(
 
 
 if __name__ == "__main__":
-    Path("transcripts/processed").mkdir(parents=True, exist_ok=True)
-    Path("conversations").mkdir(exist_ok=True)
-    uvicorn.run("transcript_service:app", host="0.0.0.0", port=8000, reload=True)
+    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    CONV_DIR.mkdir(exist_ok=True)
+    SUGGESTIONS_DIR.mkdir(exist_ok=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

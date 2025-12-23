@@ -1,7 +1,6 @@
 const BASE_URL = 'http://localhost:8000';
 
 export const api = {
-  // Upload with progress callback
   uploadAudio: (
     file: File,
     userUuid: string,
@@ -17,8 +16,7 @@ export const api = {
 
       xhr.upload.onprogress = (event) => {
         if (event.lengthComputable) {
-          const percentComplete = (event.loaded / event.total) * 100;
-          onProgress(percentComplete);
+          onProgress((event.loaded / event.total) * 100);
         }
       };
 
@@ -50,22 +48,25 @@ export const api = {
     return res.json();
   },
 
-  getSuggestions: async (convId: string) => {
-    const res = await fetch(`${BASE_URL}/conversations/${convId}/suggestions`);
+  getSuggestions: async (fileHash: string) => {
+    const res = await fetch(`${BASE_URL}/suggestions/${fileHash}`);
     return res.json();
   },
 
   deleteConversation: async (convId: string) => {
-    const res = await fetch(`${BASE_URL}/conversations/${convId}`, {
-        method: 'DELETE'
+    const res = await fetch(`${BASE_URL}/conversations/${convId}`, { method: 'DELETE' });
+    return res.json();
+  },
+
+  renameConversation: async (convId: string, title: string) => {
+    const res = await fetch(`${BASE_URL}/conversations/${convId}/rename?title=${encodeURIComponent(title)}`, {
+      method: 'PATCH'
     });
     return res.json();
   },
 
   clearHistory: async (userUuid: string) => {
-    const res = await fetch(`${BASE_URL}/conversations/clear?user_uuid=${userUuid}`, {
-        method: 'DELETE'
-    });
+    const res = await fetch(`${BASE_URL}/conversations/clear?user_uuid=${userUuid}`, { method: 'DELETE' });
     return res.json();
   },
 

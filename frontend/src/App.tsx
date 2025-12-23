@@ -6,6 +6,13 @@ import './App.css';
 
 const USER_ID = "user-123";
 
+interface ConversationItem {
+  uuid: string;
+  title?: string;
+  file_hash?: string;
+  created_at?: string;
+}
+
 const getAudioDuration = (file: File): Promise<number> => {
   return new Promise((resolve) => {
     const audio = document.createElement('audio');
@@ -20,8 +27,9 @@ const getAudioDuration = (file: File): Promise<number> => {
 };
 
 function App() {
-  const [conversations, setConversations] = useState<any[]>([]);
+  const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [currentConvId, setCurrentConvId] = useState<string | null>(null);
+  const [currentFileHash, setCurrentFileHash] = useState<string | null>(null);
   const [messages, setMessages] = useState<any[]>([]);
   const [suggestions, setSuggestions] = useState<any[]>([]);
 
@@ -35,22 +43,35 @@ function App() {
   const [stageText, setStageText] = useState("");
   const [estimatedTime, setEstimatedTime] = useState<string>("");
 
+  // Editing state
+  const [editingConvId, setEditingConvId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const editInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => { loadConversations(); }, []);
 
   useEffect(() => {
     if (currentConvId) {
       loadMessages(currentConvId);
-      loadSuggestions(currentConvId);
-      // Сброс состояний при входе в чат
+
+      // Находим file_hash из списка conversations
+      const conv = conversations.find(c => c.uuid === currentConvId);
+      if (conv?.file_hash) {
+        setCurrentFileHash(conv.file_hash);
+        loadSuggestions(conv.file_hash);
+      } else {
+        setSuggestions([]);
+      }
+
       setUploading(false);
       setProcessing(false);
       setUploadProgress(0);
       setEstimatedTime("");
     }
-  }, [currentConvId]);
+  }, [currentConvId, conversations]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -59,39 +80,59 @@ function App() {
   const loadConversations = async () => {
     try {
       const data = await api.getConversations(USER_ID);
-      setConversations(data.conversations);
-    } catch (e) { console.error("Failed to load conversations"); }
+      setConversations(data.conversations || []);
+    } catch (e) {
+      console.error("Failed to load conversations");
+      setConversations([]);
+    }
   };
 
   const loadMessages = async (id: string) => {
     try {
       const data = await api.getMessages(id);
       const uiMsgs: any[] = [];
-      data.messages.forEach((m: any) => {
-        uiMsgs.push({ role: 'user', text: m.prompt });
+      (data.messages || []).forEach((m: any) => {
+        if (m.prompt) uiMsgs.push({ role: 'user', text: m.prompt });
         if (m.answer) uiMsgs.push({ role: 'agent', text: m.answer });
       });
       setMessages(uiMsgs);
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      console.error(e);
+      setMessages([]);
+    }
   };
 
-  const loadSuggestions = async (id: string) => {
+  const loadSuggestions = async (fileHash: string) => {
     try {
-      const data = await api.getSuggestions(id);
+      const data = await api.getSuggestions(fileHash);
       setSuggestions(data || []);
-    } catch (e) { setSuggestions([]); }
+    } catch (e) {
+      console.error("Failed to load suggestions:", e);
+      setSuggestions([]);
+    }
   };
 
-  // --- ACTIONS ---
-
-  // ИСПРАВЛЕНИЕ: Функция для полного сброса состояния при нажатии "Upload New"
-  const handleNewChat = () => {
+  const resetAllState = () => {
     setCurrentConvId(null);
+    setCurrentFileHash(null);
+    setConversations([]);
     setMessages([]);
     setSuggestions([]);
     setInput("");
+    setUploading(false);
+    setProcessing(false);
+    setUploadProgress(0);
+    setStageText("");
+    setEstimatedTime("");
+    setLoading(false);
+  };
 
-    // Сбрасываем все флаги загрузки
+  const handleNewChat = () => {
+    setCurrentConvId(null);
+    setCurrentFileHash(null);
+    setMessages([]);
+    setSuggestions([]);
+    setInput("");
     setUploading(false);
     setProcessing(false);
     setUploadProgress(0);
@@ -104,17 +145,51 @@ function App() {
     if (confirm("Are you sure you want to delete this conversation?")) {
       await api.deleteConversation(uuid);
       if (currentConvId === uuid) {
-          handleNewChat(); // Используем сброс здесь тоже
+          handleNewChat();
       }
       loadConversations();
     }
   };
 
+  const handleStartRename = (e: React.MouseEvent, conv: ConversationItem) => {
+    e.stopPropagation();
+    setEditingConvId(conv.uuid);
+    setEditingTitle(conv.title || "");
+    setTimeout(() => editInputRef.current?.focus(), 0);
+  };
+
+  const handleSaveRename = async () => {
+    if (editingConvId && editingTitle.trim()) {
+      await api.renameConversation(editingConvId, editingTitle.trim());
+      setEditingConvId(null);
+      setEditingTitle("");
+      loadConversations();
+    }
+  };
+
+  const handleCancelRename = () => {
+    setEditingConvId(null);
+    setEditingTitle("");
+  };
+
+  const handleRenameKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      handleSaveRename();
+    } else if (e.key === 'Escape') {
+      handleCancelRename();
+    }
+  };
+
   const handleClearHistory = async () => {
     if (confirm("Warning: This will delete ALL history and files. Continue?")) {
-      await api.clearHistory(USER_ID);
-      setConversations([]);
-      handleNewChat();
+      try {
+        await api.clearHistory(USER_ID);
+        resetAllState();
+        await loadConversations();
+      } catch (e) {
+        console.error("Failed to clear history:", e);
+        alert("Failed to clear history.");
+      }
     }
   };
 
@@ -152,19 +227,22 @@ function App() {
         setUploadProgress(percent);
       });
 
-      setUploadProgress(0);
-      setStageText("Initializing AI...");
-      setProcessing(true);
+      const fileHash = res.file_hash;
+      const convId = res.conversation_uuid;
+      setCurrentFileHash(fileHash);
 
       if (res.is_cached) {
           setUploadProgress(100);
-          setCurrentConvId(res.conversation_uuid);
+          setCurrentConvId(convId);
           await loadConversations();
+          await loadSuggestions(fileHash);
+          setUploading(false);
           return;
       }
 
-      const fileHash = res.file_hash;
-      const convId = res.conversation_uuid;
+      setUploadProgress(0);
+      setStageText("Initializing AI...");
+      setProcessing(true);
 
       const pollInterval = setInterval(async () => {
         if (timeLeft > 0) {
@@ -186,10 +264,14 @@ function App() {
                 setEstimatedTime("Ready!");
                 setCurrentConvId(convId);
                 await loadConversations();
+                await loadSuggestions(fileHash);
+                setUploading(false);
+                setProcessing(false);
             } else if (statusRes.status === 'error') {
                 clearInterval(pollInterval);
                 alert("Error: " + statusRes.error);
                 setUploading(false);
+                setProcessing(false);
             }
         } catch (e) { console.error(e); }
       }, 1000);
@@ -197,6 +279,7 @@ function App() {
     } catch (err) {
       alert("Upload failed.");
       setUploading(false);
+      setProcessing(false);
     }
   };
 
@@ -268,14 +351,41 @@ function App() {
       <div className="sidebar">
         <div className="sidebar-header"><span>🎙️ AutoLectures</span></div>
         <div style={{padding: '15px'}}>
-            {/* ИСПРАВЛЕНИЕ: Вызываем handleNewChat вместо inline функции */}
             <button className="new-chat-btn" onClick={handleNewChat}>+ Upload New</button>
         </div>
         <div className="conv-list">
           {conversations.map(c => (
-             <div key={c.uuid} className={`conv-item ${c.uuid === currentConvId ? 'active' : ''}`} onClick={() => setCurrentConvId(c.uuid)}>
-                <span className="title">{c.title || new Date(c.created_at).toLocaleDateString()}</span>
-                <span className="delete-icon" onClick={(e) => handleDeleteConv(e, c.uuid)}>×</span>
+             <div
+               key={c.uuid}
+               className={`conv-item ${c.uuid === currentConvId ? 'active' : ''}`}
+               onClick={() => editingConvId !== c.uuid && setCurrentConvId(c.uuid)}
+             >
+                {editingConvId === c.uuid ? (
+                  <input
+                    ref={editInputRef}
+                    type="text"
+                    className="rename-input"
+                    value={editingTitle}
+                    onChange={(e) => setEditingTitle(e.target.value)}
+                    onKeyDown={handleRenameKeyDown}
+                    onBlur={handleSaveRename}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                ) : (
+                  <>
+                    <span
+                      className="title"
+                      onDoubleClick={(e) => handleStartRename(e, c)}
+                      title="Double-click to rename"
+                    >
+                      {c.title || new Date(c.created_at || '').toLocaleDateString()}
+                    </span>
+                    <div className="conv-actions">
+                      <span className="edit-icon" onClick={(e) => handleStartRename(e, c)}>✏️</span>
+                      <span className="delete-icon" onClick={(e) => handleDeleteConv(e, c.uuid)}>×</span>
+                    </div>
+                  </>
+                )}
              </div>
           ))}
         </div>
@@ -291,15 +401,6 @@ function App() {
                 <button onClick={handleDownloadReport} className="download-btn">⬇ Report</button>
             </div>
             <div className="messages">
-                {suggestions.length > 0 && (
-                     <div className="suggestions-grid">
-                        {suggestions.map(s => (
-                            <div key={s.id} className="suggestion-card" onClick={() => applySuggestion(s)}>
-                                <div className="s-header"><span className="s-icon">✨</span><span>{s.label}</span></div>
-                            </div>
-                        ))}
-                     </div>
-                )}
                 {messages.map((m, i) => (
                     <div key={i} className={`message ${m.role}`}>
                         <div className="bubble"><ReactMarkdown>{m.text}</ReactMarkdown></div>
@@ -307,8 +408,33 @@ function App() {
                 ))}
                 <div ref={messagesEndRef} />
             </div>
+
+            {/* Suggestions перемещены вниз, над полем ввода */}
+            {suggestions.length > 0 && (
+                <div className="suggestions-container">
+                    <div className="suggestions-scroll">
+                        {suggestions.map(s => (
+                            <button
+                                key={s.id}
+                                className="suggestion-chip"
+                                onClick={() => applySuggestion(s)}
+                                disabled={loading}
+                            >
+                                {s.label}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            )}
+
             <div className="input-area">
-                <input value={input} onChange={e => setInput(e.target.value)} onKeyPress={e => e.key==='Enter' && handleSend()} placeholder="Ask..." disabled={loading}/>
+                <input
+                    value={input}
+                    onChange={e => setInput(e.target.value)}
+                    onKeyPress={e => e.key==='Enter' && !loading && handleSend()}
+                    placeholder="Ask about the transcript..."
+                    disabled={loading}
+                />
                 <button onClick={() => handleSend()} disabled={loading}>➤</button>
             </div>
         </div>

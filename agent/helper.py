@@ -2,6 +2,8 @@ from typing import Any, Dict, Optional, List, Tuple
 import os
 import json
 import ast
+from pathlib import Path
+
 
 def parse_json(answer):
     try:
@@ -13,14 +15,20 @@ def parse_json(answer):
             pass
     return answer
 
+
+# Определяем BASE_DIR один раз
+_BASE_DIR = Path(__file__).resolve().parent.parent
+_CONV_DIR = _BASE_DIR / "conversations"
+
+
 class AgentSession:
     conversation_id: str
     message_id: str
 
     def __init__(
-        self,
-        conversation_id: str,
-        message_id: str
+            self,
+            conversation_id: str,
+            message_id: str
     ):
         self.conversation_id = conversation_id
         self.message_id = message_id
@@ -28,27 +36,34 @@ class AgentSession:
         self.transcript = ""
 
     def save(self):
+        # Используем абсолютный путь
+        if not _CONV_DIR.exists():
+            _CONV_DIR.mkdir(parents=True, exist_ok=True)
 
-        if not os.path.exists("../conversations"):
-            os.makedirs("../conversations")
+        filepath = _CONV_DIR / self.conversation_id
 
-        with open(f"./conversations/{self.conversation_id}", "w") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             dump = {
                 "transcript": self.transcript,
                 "answers": self.answers,
             }
-
-            json.dump(dump, f)
+            json.dump(dump, f, ensure_ascii=False)
 
     def load(self):
-        path = f"./conversations/{self.conversation_id}"
-        if not os.path.exists(path):
+        filepath = _CONV_DIR / self.conversation_id
+
+        if not filepath.exists():
             return
 
-        with open(f"./conversations/{self.conversation_id}", "r") as f:
-            dump = json.load(f)
-            self.answers = dump.get("answers", [])
-            self.transcript = dump.get("transcript", "")
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                dump = json.load(f)
+                self.answers = dump.get("answers", [])
+                self.transcript = dump.get("transcript", "")
+        except Exception as e:
+            print(f"Error loading session {self.conversation_id}: {e}")
+            self.answers = []
+            self.transcript = ""
 
     def start_new_turn(self):
         """Call this at the start of each user message"""

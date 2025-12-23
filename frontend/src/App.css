@@ -3,7 +3,7 @@
   --sidebar-bg: #1f2937;
   --sidebar-text: #e5e7eb;
   --sidebar-hover: #374151;
-  --accent-color: #6366f1; /* Indigo */
+  --accent-color: #6366f1;
   --accent-hover: #4f46e5;
   --chat-bg: #ffffff;
   --user-bubble: #6366f1;
@@ -47,7 +47,7 @@ body {
 }
 
 .new-chat-btn {
-  margin: 15px;
+  margin: 0;
   padding: 12px;
   background-color: var(--accent-color);
   color: white;
@@ -56,7 +56,7 @@ body {
   font-weight: 600;
   cursor: pointer;
   transition: all 0.2s;
-  width: calc(100% - 30px);
+  width: 100%;
 }
 
 .new-chat-btn:hover { background-color: var(--accent-hover); }
@@ -81,10 +81,10 @@ body {
 }
 
 .conv-item span.title {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 200px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
 }
 
 .conv-item:hover {
@@ -99,25 +99,65 @@ body {
 }
 
 .delete-icon {
-    opacity: 0;
-    font-size: 1.1rem;
-    padding: 0 4px;
-    border-radius: 4px;
+  opacity: 0;
+  font-size: 1.1rem;
+  padding: 0 4px;
+  border-radius: 4px;
 }
-.conv-item:hover .delete-icon { opacity: 0.6; }
-.delete-icon:hover { opacity: 1 !important; color: #ef4444; background: rgba(255,0,0,0.1); }
+
+.conv-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.conv-item:hover .conv-actions { opacity: 1; }
+
+.edit-icon {
+  font-size: 0.8rem;
+  padding: 2px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.edit-icon:hover { background: rgba(99, 102, 241, 0.2); }
+
+.delete-icon {
+  font-size: 1.1rem;
+  padding: 0 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.delete-icon:hover { color: #ef4444; background: rgba(255,0,0,0.1); }
+
+.rename-input {
+  flex: 1;
+  background: #374151;
+  border: 1px solid #6366f1;
+  border-radius: 4px;
+  color: white;
+  padding: 4px 8px;
+  font-size: 0.9rem;
+  outline: none;
+}
+
+.rename-input:focus {
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.3);
+}
 
 .clear-history-btn {
-    width: 100%;
-    padding: 10px;
-    background: transparent;
-    color: #ef4444;
-    border: 1px solid #ef4444;
-    border-radius: 6px;
-    cursor: pointer;
-    margin-top: 10px;
-    transition: all 0.2s;
+  width: 100%;
+  padding: 10px;
+  background: transparent;
+  color: #ef4444;
+  border: 1px solid #ef4444;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s;
 }
+
 .clear-history-btn:hover { background: rgba(239, 68, 68, 0.1); }
 
 /* --- MAIN AREA --- */
@@ -130,31 +170,32 @@ body {
 }
 
 .chat-header {
-    padding: 15px 40px;
-    border-bottom: 1px solid var(--border-color);
-    background: white;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-weight: 600;
-    color: #1f2937;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+  padding: 15px 40px;
+  border-bottom: 1px solid var(--border-color);
+  background: white;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  color: #1f2937;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.03);
 }
 
 .download-btn {
-    padding: 8px 14px;
-    font-size: 0.85rem;
-    background: white;
-    border: 1px solid #d1d5db;
-    border-radius: 6px;
-    cursor: pointer;
-    font-weight: 500;
-    color: #4b5563;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    transition: all 0.2s;
+  padding: 8px 14px;
+  font-size: 0.85rem;
+  background: white;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+  color: #4b5563;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s;
 }
+
 .download-btn:hover { background: #f9fafb; border-color: #9ca3af; }
 
 /* --- MESSAGES --- */
@@ -205,37 +246,57 @@ body {
 .bubble li { margin-bottom: 4px; }
 .bubble strong { font-weight: 600; }
 
-/* --- SUGGESTIONS --- */
-.suggestions-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 15px;
-    margin-bottom: 20px;
-    animation: fadeIn 0.5s ease-in;
+/* --- SUGGESTIONS (внизу, над input) --- */
+.suggestions-container {
+  padding: 10px 40px;
+  background: #f8fafc;
+  border-top: 1px solid var(--border-color);
 }
 
-.suggestion-card {
-    background: white;
-    border: 1px solid #e2e8f0;
-    padding: 15px;
-    border-radius: 10px;
-    cursor: pointer;
-    transition: all 0.2s;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
+.suggestions-scroll {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 5px;
 }
 
-.suggestion-card:hover {
-    border-color: var(--accent-color);
-    transform: translateY(-2px);
-    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+.suggestions-scroll::-webkit-scrollbar {
+  height: 4px;
 }
 
-.s-header { display: flex; align-items: center; gap: 8px; color: #4b5563; font-weight: 600; font-size: 0.9rem; }
-.s-icon { font-size: 1.2rem; }
-.s-desc { font-size: 0.8rem; color: #9ca3af; }
+.suggestions-scroll::-webkit-scrollbar-track {
+  background: #e2e8f0;
+  border-radius: 2px;
+}
+
+.suggestions-scroll::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 2px;
+}
+
+.suggestion-chip {
+  flex-shrink: 0;
+  padding: 8px 16px;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  font-size: 0.85rem;
+  color: #4b5563;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.suggestion-chip:hover {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+  background: #f0f0ff;
+}
+
+.suggestion-chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 
 /* --- INPUT AREA --- */
 .input-area {
@@ -277,7 +338,9 @@ body {
   font-size: 1.2rem;
   transition: background 0.2s;
 }
+
 .input-area button:hover { background-color: var(--accent-hover); }
+.input-area button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* --- UPLOAD WIDGET --- */
 .upload-container {
@@ -291,7 +354,6 @@ body {
 .drop-zone {
   width: 100%;
   max-width: 480px;
-  /* Уберем фиксированную высоту, чтобы контент не вылезал */
   min-height: 320px;
   border: 2px dashed #cbd5e1;
   border-radius: 20px;
@@ -302,16 +364,36 @@ body {
   justify-content: center;
   transition: all 0.3s ease;
   cursor: pointer;
-  padding: 40px; /* Увеличим отступ */
+  padding: 40px;
   box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-  box-sizing: border-box; /* Важно */
+  box-sizing: border-box;
 }
 
-/* Фикс для прогресс-бара */
+.drop-zone.dragging {
+  border-color: var(--accent-color);
+  background-color: rgba(99, 102, 241, 0.05);
+}
+
+.drop-icon {
+  font-size: 3rem;
+  margin-bottom: 15px;
+}
+
+.drop-text {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #1f2937;
+  margin-bottom: 8px;
+}
+
+.drop-subtext {
+  font-size: 0.9rem;
+  color: #9ca3af;
+}
+
 .progress-wrapper {
   width: 100%;
   margin-top: 20px;
-  /* Убедимся, что он занимает всю ширину внутри padding */
   box-sizing: border-box;
 }
 
@@ -322,7 +404,7 @@ body {
   font-size: 0.9rem;
   color: #64748b;
   font-weight: 500;
-  width: 100%; /* Явно указываем ширину */
+  width: 100%;
 }
 
 .progress-track {
@@ -330,7 +412,7 @@ body {
   background-color: #f1f5f9;
   border-radius: 5px;
   overflow: hidden;
-  width: 100%; /* Явно указываем ширину */
+  width: 100%;
 }
 
 .progress-fill {
@@ -338,5 +420,3 @@ body {
   background-color: var(--accent-color);
   transition: width 0.4s ease;
 }
-
-@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
